@@ -1,0 +1,133 @@
+# 1. Imports
+import pandas as pd
+import numpy as np
+import streamlit as st
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertForSequenceClassification, AdamW
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from flask import Flask, request, jsonify
+import matplotlib.pyplot as plt
+import seaborn as sns
+import re, string, os
+
+# 2. Load & Preprocess Data
+df = pd.read_csv("customer_support.csv")
+df.dropna(inplace=True)
+df.drop_duplicates(subset='text', inplace=True)
+
+# Text cleaning
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r"http\S+|www\S+|@\w+|#", "", text)
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+    return text
+
+df['clean_text'] = df['text'].apply(clean_text)
+
+# Encode labels
+intent_enc = LabelEncoder()
+sentiment_enc = LabelEncoder()
+df['intent_enc'] = intent_enc.fit_transform(df['intent'])
+df['sentiment_enc'] = sentiment_enc.fit_transform(df['sentiment'])
+
+# 3. Dataset and Dataloader
+class ChatDataset(Dataset):
+    def __init__(self, texts, labels):
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.texts = texts
+        self.labels = labels
+
+    def __len__(self): return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        encoding = self.tokenizer(text, truncation=True, padding='max_length', max_length=64, return_tensors='pt')
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+            'label': torch.tensor(self.labels[idx], dtype=torch.long)
+        }
+
+# Split
+train_texts, val_texts, train_labels, val_labels = train_test_split(df['clean_text'], df['intent_enc'], test_size=0.2)
+train_data = ChatDataset(train_texts.tolist(), train_labels.tolist())
+val_data = ChatDataset(val_texts.tolist(), val_labels.tolist())
+
+train_loader = DataLoader(train_data, batch_size=16, shuffle=True)
+val_loader = DataLoader(val_data, batch_size=16)
+
+# 4. Model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=len(intent_enc.classes_))
+model.to(device)
+
+# Optimizer
+optimizer = AdamW(model.parameters(), lr=2e-5)
+
+# 5. Training Loop (simplified)
+for epoch in range(2):
+    model.train()
+    for batch in train_loader:
+        input_ids = batch['input_ids'].to(device)
+        mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
+
+        outputs = model(input_ids, attention_mask=mask, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+# Save model
+model.save_pretrained("chatbot_model")
+intent_enc.classes_.tofile("intent_labels.txt", sep="\n")
+
+# 6. Inference
+def predict_intent(text):
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = BertForSequenceClassification.from_pretrained("chatbot_model").to(device)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding='max_length', max_length=64)
+    inputs = {key: val.to(device) for key, val in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs)
+    pred = torch.argmax(outputs.logits).item()
+    labels = np.loadtxt("intent_labels.txt", dtype=str)
+    return labels[pred]
+
+# 7. Streamlit UI
+def run_streamlit():
+    st.title("Customer Support Chatbot")
+    user_input = st.text_input("Ask your question:")
+    if st.button("Submit"):
+        intent = predict_intent(user_input)
+        st.success(f"Predicted Intent: {intent}")
+
+# 8. Flask API
+app = Flask(__name__)
+
+@app.route('/predict', methods=['POST'])
+def api_predict():
+    data = request.json
+    text = data.get("text", "")
+    result = predict_intent(text)
+    return jsonify({"intent": result})
+
+# 9. EDA Visualization
+def plot_eda():
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    sns.countplot(data=df, x='intent', ax=ax[0])
+    sns.countplot(data=df, x='sentiment', ax=ax[1])
+    st.pyplot(fig)
+
+# 10. Entry Point
+if __name__ == "__main__":
+    # For local run
+    run = input("Run [streamlit/flask/eda]: ").strip()
+    if run == "streamlit":
+        run_streamlit()
+    elif run == "flask":
+        app.run(debug=True)
+    elif run == "eda":
+        plot_eda()
